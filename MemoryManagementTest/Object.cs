@@ -1,47 +1,70 @@
 ﻿using System.ComponentModel;
-using System.Drawing;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.InteropServices;
+using System;
+using Unmanaged.Interfaces;
+using Unmanaged.Collections;
+using Unmanaged.Extensions;
+using System.Collections.Generic;
 
-namespace MemoryManagementTest
+namespace Unmanaged
 {
-    public struct Object<TType>
+    public unsafe struct Object<TType>
     {
-        private delegate TType CreateHandler(IntPtr ptr);
+        private delegate TType CastHandler(IntPtr ptr);
         private delegate IntPtr FindHandler(TType obj);
-        private delegate int SizeOfHelperHandler(Type type, bool throwIfNotMarshalable);
 
-        private static readonly CreateHandler Create;
+        private static readonly CastHandler Cast;
         private static readonly FindHandler Find;
-        private static readonly SizeOfHelperHandler SizeOfHelper;
+        private static readonly MethodInfo get_Item;
 
         private static readonly IntPtr _typePointer;
         private static readonly int _typeSize;
+        private static readonly bool _canCreate;
         private static readonly ConstructorInfo[] _constructors;
+        private static readonly ConstructorHandler[] _constructorHandlers;
+        private static readonly Dictionary<Object<Type>[], ConstructorHandler> _constructorCache;
 
-        private readonly TType _value;
+        private readonly IntPtr _pointer;
 
-        public TType Value => _value;
+        public TType Value => Cast(_pointer);
 
         public Object()
         {
-            _value = New();
+            if (!_canCreate)
+                throw new ArgumentException();
+
+            _pointer = New(Span<Object<object>>.Empty);
 
             if (Value is IObject unmanaged)
                 unmanaged.Destroyed += OnDestroyed;
+
+            Console.WriteLine(_pointer);
         }
 
-        public Object(params object[] arguments)
+        public Object(Span<Object<object>> arguments)
         {
-            _value = New(arguments);
+            if (!_canCreate)
+                throw new ArgumentException();
+
+            _pointer = New(arguments);
 
             if (Value is IObject unmanaged)
                 unmanaged.Destroyed += OnDestroyed;
         }
 
         private Object(TType value)
-            => _value = value;
+        {
+            if (value is null)
+                throw new ArgumentNullException(nameof(value));
+            if (!_canCreate)
+                throw new ArgumentException();
+            if (typeof(TType).IsValueType)
+                throw new ArgumentException();
+
+            _pointer = Find(value);
+        }
 
         public static implicit operator TType(Object<TType> value)
             => value.Value;
@@ -49,12 +72,19 @@ namespace MemoryManagementTest
         public static implicit operator Object<TType>(TType value)
             => new Object<TType>(value);
 
-        public void Destroy()
+        public void Destroy(bool blocking = false)
         {
+            Console.WriteLine(_pointer);
+
             if (Value is IObject unmanaged)
-                unmanaged.Destroy();
+                unmanaged.Destroy(blocking);
             else
-                Destroy(Value);
+            {
+                if (blocking)
+                    Destroy(Value);
+                else
+                    ObjectHandler.Destroy(Destroy);
+            }
         }
 
         public override string? ToString()
@@ -66,51 +96,51 @@ namespace MemoryManagementTest
         public override bool Equals(object? value)
             => Value!.Equals(value);
 
-        private void OnDestroyed()
+        private void OnDestroyed(bool blocking)
         {
             IObject unmanaged = (IObject)Value!;
 
             unmanaged.Destroyed -= OnDestroyed;
 
-            Destroy(Value);
+            if (blocking)
+                Destroy(Value);
+            else
+                ObjectHandler.Destroy(Destroy);
         }
 
         static Object()
         {
+            Cast = GenerateCastMethod();
+            Find = GenerateFindMethod();
+            get_Item = typeof(Span<object>).GetMethod(nameof(get_Item))!;
+
             _typePointer = typeof(TType).TypeHandle.Value;
             _typeSize = Marshal.ReadInt32(_typePointer, sizeof(int));
+            _canCreate = !typeof(TType).IsArray;
             _constructors = typeof(TType).GetConstructors(BindingFlags.Instance | BindingFlags.Public);
-
-            DynamicMethod method = new DynamicMethod(nameof(Create), typeof(TType), new Type[] { typeof(IntPtr) }, true);
-            ILGenerator generator = method.GetILGenerator();
-            generator.Emit(OpCodes.Ldarg_0);
-            generator.Emit(OpCodes.Ret);
-
-            Create = (CreateHandler)method.CreateDelegate(typeof(CreateHandler));
-
-            method = new DynamicMethod(nameof(Find), typeof(IntPtr), new Type[] { typeof(TType) }, true);
-            generator = method.GetILGenerator();
-            generator.Emit(OpCodes.Ldarg_0);
-            generator.Emit(OpCodes.Ret);
-
-            Find = (FindHandler)method.CreateDelegate(typeof(FindHandler));
-
-            MethodInfo methodInfo = typeof(Marshal).GetMethod(nameof(SizeOfHelper),
-                BindingFlags.NonPublic | BindingFlags.Static,
-                new Type[] { typeof(Type), typeof(bool) })!;
-
-            SizeOfHelper = (SizeOfHelperHandler)Delegate.CreateDelegate(typeof(SizeOfHelperHandler), methodInfo);
+            _constructorHandlers = GenerateConstructorHandlers(_constructors);
+            _constructorCache = GenerateConstructorCache(_constructors, _constructorHandlers);
         }
 
-        private static void Destroy(TType obj)
-        {
-            IntPtr pointer = Find(obj);
-            IntPtr handle = pointer - IntPtr.Size;
+        private void Destroy() =>
+            Destroy(Value);
 
+        private static void Destroy(TType? value)
+        {
+            if (value is null)
+                throw new ArgumentNullException(nameof(value));
+
+            IntPtr pointer = Find(value);
+            IntPtr handle = pointer - IntPtr.Size;
+            IntPtr frozenSegment = ObjectHandler.Objects[handle];
+
+            ObjectHandler.Objects.Remove(handle);
+
+            ObjectHandler.UnregisterFrozenSegment(frozenSegment);
             Marshal.FreeHGlobal(handle);
         }
 
-        private static bool DoTypesMatch(object[] arguments, ParameterInfo[] parameters, out int bestFitCount)
+        private static bool DoTypesMatch(Span<Object<object>> arguments, ParameterInfo[] parameters, out int bestFitCount)
         {
             Type argumentType;
             Type parameterType;
@@ -142,7 +172,91 @@ namespace MemoryManagementTest
             return true;
         }
 
-        private static unsafe void Initialize(IntPtr handle, int length, long size, int[] dimensions)
+        private static ConstructorHandler[] GenerateConstructorHandlers(ConstructorInfo[] constructors)
+        {
+            ConstructorHandler[] constructorHandlers = new ConstructorHandler[_constructors.Length];
+
+            for (int index = 0; index < constructorHandlers.Length; index++)
+                constructorHandlers[index] = GenerateConstructorHandler(constructors[index]);
+
+            return constructorHandlers;
+        }
+
+        private static Dictionary<Object<Type>[], ConstructorHandler> GenerateConstructorCache(ConstructorInfo[] constructors, ConstructorHandler[] constructorHandlers)
+        {
+            Dictionary<Object<Type>[], ConstructorHandler> constructorCache = new Dictionary<Object<Type>[], ConstructorHandler>();
+            ParameterInfo[] parameters;
+            Object<Type>[] types;
+
+            for (int index = 0; index < constructors.Length; index++)
+            {
+                parameters = constructors[index].GetParameters();
+                types = new Array<Object<Type>[]>(parameters.Length);
+
+                for (int parameterIndex = 0; parameterIndex < types.Length; parameterIndex++)
+                    types[parameterIndex] = parameters[parameterIndex].GetType();
+
+                constructorCache.Add(types, constructorHandlers[index]);
+            }
+
+            return constructorCache;
+        }
+
+        private static ConstructorHandler GenerateConstructorHandler(ConstructorInfo constructor)
+        {
+            DynamicMethod dynamicMethod = new DynamicMethod(nameof(ConstructorHandler), typeof(void), new[] { typeof(object), typeof(Span<Object<object>>) }, true);
+            ILGenerator generator = dynamicMethod.GetILGenerator();
+            ParameterInfo[] parameters = constructor.GetParameters();
+            Type? parameterType;
+
+            generator.Emit(OpCodes.Nop);
+            generator.Emit(OpCodes.Ldarg_0); // Load first argument onto the stack.
+            for (int index = 0; index < parameters.Length; index++)
+            {
+                generator.Emit(OpCodes.Ldarga_S, 1); // Load second argument address onto the stack.
+                generator.Emit(OpCodes.Ldc_I4, index); // Specify index of the collection.
+                generator.Emit(OpCodes.Call, get_Item); // Call '[]' on Span.
+                generator.Emit(OpCodes.Ldind_Ref); // Load object's reference onto the stack from [index]
+
+                // Unbox the parameter value if necessary.
+                parameterType = parameters[index].ParameterType;
+                if (parameterType.IsValueType)
+                    generator.Emit(OpCodes.Unbox_Any, parameterType); // Unbox object to the parameter type
+                else
+                    generator.Emit(OpCodes.Castclass, parameterType); // Cast object to the parameter type
+            }
+            generator.Emit(OpCodes.Call, constructor); // Call the constructor to initialize the object.
+            generator.Emit(OpCodes.Nop);
+            generator.Emit(OpCodes.Ret); // Return from the dynamic method.
+
+            return (ConstructorHandler)dynamicMethod.CreateDelegate(typeof(ConstructorHandler));
+        }
+
+        private static CastHandler GenerateCastMethod()
+        {
+            DynamicMethod method = new DynamicMethod(nameof(Cast), typeof(TType), new Type[] { typeof(IntPtr) }, true);
+            ILGenerator generator = method.GetILGenerator();
+            // Load the current parameter value onto the stack.
+            generator.Emit(OpCodes.Ldarg_0);
+            // Return from the dynamic method.
+            generator.Emit(OpCodes.Ret);
+
+            return (CastHandler)method.CreateDelegate(typeof(CastHandler));
+        }
+
+        private static FindHandler GenerateFindMethod()
+        {
+            DynamicMethod method = new DynamicMethod(nameof(Find), typeof(IntPtr), new Type[] { typeof(TType) }, true);
+            ILGenerator generator = method.GetILGenerator();
+            // Load the current parameter value onto the stack.
+            generator.Emit(OpCodes.Ldarg_0);
+            // Return from the dynamic method.
+            generator.Emit(OpCodes.Ret);
+
+            return (FindHandler)method.CreateDelegate(typeof(FindHandler));
+        }
+
+        private static void Initialize(IntPtr handle, int length, long size, Object<int>[] dimensions)
         {
             long startPosition = IntPtr.Size * 2;
             long endPosition = IntPtr.Size * 2 + sizeof(long);
@@ -167,59 +281,62 @@ namespace MemoryManagementTest
                 bytes[index] = 0;
         }
 
-        private static TType New(params object[] arguments)
+        private static IntPtr New(Span<Object<object>> arguments)
         {
-            if (typeof(TType).IsArray)
-            {
-                if (!typeof(TType).GetElementType()!.IsGenericType
-                    || (typeof(TType).GetElementType()!.IsGenericType
-                    && typeof(TType).GetElementType()!.GetGenericTypeDefinition() != typeof(Object<>)))
-                    throw new ArrayTypeMismatchException();
-
-                int[] dimensions = GetDimensions(arguments);
-
-                return New(dimensions);
-            }
-
             int size = _typeSize + IntPtr.Size;
             IntPtr handle = Marshal.AllocHGlobal(size);
             IntPtr pointer = handle + IntPtr.Size;
 
             Marshal.WriteIntPtr(pointer, _typePointer);
+            IntPtr frozenSegment = ObjectHandler.RegisterFrozenSegment(handle, size);
 
-            TType value = Create(pointer);
+            ObjectHandler.Objects.Add(handle, frozenSegment);
 
-            if (!TryGet(arguments, out ConstructorInfo? constructor))
+            TType value = Cast(pointer);
+
+            if (!TryGet(arguments, out ConstructorHandler? constructor))
                 throw new ArgumentException();
 
             constructor?.Invoke(value, arguments);
 
-            return value;
+            return pointer;
         }
 
-        private static TType New(int[] dimensions)
+        private static bool TryGet(Span<Object<object>> arguments, out ConstructorHandler? constructor)
         {
-            int length = GetLength(dimensions);
-            int size = GetSize(length);
-            IntPtr handle = Marshal.AllocHGlobal(size);
-            IntPtr pointer = handle + IntPtr.Size;
+            Object<Type>[] types = new Array<Object<Type>[]>(arguments.Length);
 
-            Marshal.WriteIntPtr(pointer, _typePointer);
+            for (int index = 0; index < types.Length; index++)
+                types[index] = arguments[index].GetType();
 
-            TType value = Create(pointer);
+            if (TryGetFromCache(types, out constructor))
+            {
+                types.Destroy();
 
-            Initialize(handle, length, size, dimensions);
+                return true;
+            }
 
-            return value;
+            if (TryGet(arguments, out int bestFitIndex))
+            {
+                constructor = _constructorHandlers[bestFitIndex];
+
+                _constructorCache.Add(types, constructor);
+
+                return true;
+            }
+
+            types.Destroy();
+
+            return false;
         }
 
-        private static bool TryGet(object[] arguments, out ConstructorInfo? constructor)
+        private static bool TryGet(Span<Object<object>> arguments, out int bestFitIndex)
         {
-            int bestFitIndex = -1;
             int bestFitCount = 0;
+            ConstructorInfo? constructor;
             ParameterInfo[] parameters;
 
-            constructor = default;
+            bestFitIndex = -1;
 
             for (int index = 0; index < _constructors.Length; index++)
             {
@@ -236,93 +353,26 @@ namespace MemoryManagementTest
                         bestFitCount = currentBestFitCount;
 
                         if (bestFitCount == arguments.Length)
-                        {
-                            constructor = _constructors[bestFitIndex];
-
                             return true;
-                        }
                     }
                 }
             }
 
-            if (bestFitIndex < 0)
-                return false;
-
-            constructor = _constructors[bestFitIndex];
-
-            return true;
+            return false;
         }
 
-        private static int[] GetDimensions(params object[] arguments)
+        private static bool TryGetFromCache(Object<Type>[] types, out ConstructorHandler? constructor)
         {
-            TypeConverter converter;
+            constructor = default;
 
-            if (arguments.Length < 1)
-                throw new ArgumentException();
-
-            int[] dimensions = new int[arguments.Length];
-
-            for (int index = 0; index < arguments.Length; index++)
+            if (_constructorCache.TryGetValue(types, out ConstructorHandler? constructorInfo))
             {
-                object argument = arguments[index];
+                constructor = constructorInfo;
 
-                if (argument is null)
-                    throw new ArgumentNullException(nameof(argument));
-                if (!argument.GetType().IsValueType)
-                    throw new ArgumentException();
-
-                converter = TypeDescriptor.GetConverter(argument.GetType());
-
-                if (!converter.CanConvertTo(typeof(long)))
-                    throw new ArgumentException();
-
-                long dimension = (long)converter.ConvertTo(argument, typeof(long))!;
-
-                if (dimension > Array.MaxLength)
-                    throw new OutOfMemoryException();
-
-                dimensions[index] = (int)dimension;
+                return true;
             }
 
-            return dimensions;
-        }
-
-        private static int GetElementSize(Type type)
-        {
-            if (type.IsValueType)
-            {
-                if (type.IsGenericType)
-                    return SizeOfHelper(type, true);
-
-                return Marshal.SizeOf(type);
-            }
-            else
-                return IntPtr.Size;
-        }
-
-        private static int GetLength(int[] dimensions)
-        {
-            long length = dimensions[0];
-
-            for (int index = 1; index < dimensions.Length; index++)
-                length *= dimensions[index];
-
-            if (length > Array.MaxLength)
-                throw new OutOfMemoryException();
-
-            return (int)length;
-        }
-
-        private static int GetSize(int length)
-        {
-            Type elementType = typeof(TType).GetElementType()!;
-            long elementSize = GetElementSize(elementType);
-            long size = elementSize * length + _typeSize + IntPtr.Size;
-
-            if (size > int.MaxValue)
-                throw new OutOfMemoryException();
-
-            return (int)size;
+            return false;
         }
     }
 }
